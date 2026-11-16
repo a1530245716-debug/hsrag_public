@@ -62,6 +62,11 @@ class RetrievalBackend:
 - 测试实现：`MockBackend`
 - 换内核只改一个文件，不动前端、权限和业务。
 
+> **实施进度（2026-11）**：当前可运行的是 `LocalBM25Backend`（进程内 BM25 + 向量 + 重排），
+> 已用窄接口 `retrieve(kb_id, query, top_k)` 接入 BFF；`MockBackend` 用于验证 feature flag；
+> `RagflowBackend` 为骨架，等有 RAGFlow 服务时填实现。数据集管理/写入/答案流仍由 BFF
+> 业务代码承担，没有塞进检索接口。
+
 ## 4. 数据模型（建议）
 
 ```sql

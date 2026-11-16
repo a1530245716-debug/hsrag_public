@@ -188,3 +188,16 @@ python tools/loadtest/run_loadtest.py --levels 50,100 --yes
 - Elasticsearch/OpenSearch（BM25 + kNN）+ TEI/Infinity embedding/rerank；
 - 或 FastGPT（pgvector/Milvus）；
 - 业务层不改，只换 Adapter。
+
+## 9. 实施后的评测与压测（2026-11）
+
+- 问答评测：**6/6**（6 条真实风格问答；此前基线 5/6）。
+- 多用户压测：16 个测试账号、多 token 轮转、每档 20 并发，mock LLM 2.3s/答，
+  真实 BM25 + 重排（56,426 块）。
+  - 容量：global=4/6/8/12/20 全部放行时，吞吐从 4 并发起饱和在 **0.20 条/秒**；
+    首字 p95 15.9 / 25.6 / 36.7 / 52.7 / 85.8s。
+  - 固定 global、20 并发：4→16 个 429 / p95 16.1s；6→14 / 25.9s；
+    8→12 / 37.6s；12→8 / 53.8s；20→0 / 85.8s。
+  - 最终取 **global_max=6**：p95 26s 内、队列有界，超出明确 429。
+- 实施细节：`optimization.md`；技术取舍：`technical-notes.md` 第 14 节。
+- 口径：测试机同时跑生产/开发实例，绝对延迟偏悲观；mock LLM 只模拟 2.3s。

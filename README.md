@@ -11,6 +11,9 @@ This repository is a **sanitized portfolio**: architecture, delivery playbook, b
 - Knowledge base: **56,426 chunks** of Chinese project documents (anonymized).
 - Benchmarked with a **mock LLM (2.3s per answer)** to isolate application-side bottlenecks.
 - Baseline: **10 concurrent → p95 42.4s; 30 → 127.3s; 50 → 173.3s; 100 → 315.5s**.
+- **After the first optimization round (2026-11)**: explicit 429 admission control;
+  50-concurrency admitted TTFT p50 127.4s → 15.2s; BM25 75–172ms → 1.6–7.0ms;
+  a 16-account sweep set `global_max=6` (p95 25.9s at a 20-way burst).
 - Root causes: in-process Python BM25 (GIL), a 2-slot CPU reranker, and synchronous SSE occupying a 40-thread pool.
 - Target architecture: **async BFF + external RAG core (RAGFlow/Elasticsearch) + internal LLM gateway + Redis/Postgres/MinIO**.
 - Included: a **runnable async BFF + mock RAG demo**, no Docker or external model required.
@@ -32,6 +35,26 @@ Evidence from logs:
 - 29 reranker queue timeouts (120s wait, then degraded).
 - 32 upstream streams hit a 90s timeout even though the mock only takes 2.3s — GIL starvation, not upstream slowness.
 - At 100 concurrency, 97% of requests waited ≥120s for the first token; 57% waited ≥200s.
+
+## After the first optimization round (2026-11)
+
+The same app, after three rounds of changes (admission control, async SSE, and
+in-process retrieval optimizations):
+
+| Metric | Before | After |
+|---|---|---|
+| 50 concurrent admitted TTFT p50 | 127.4s | **15.2s** |
+| 50 concurrent with per-user limit 2 | 127.4s | **8.5s** (rest 429) |
+| `/api/health` idle p95 | 1985ms at 100 concurrency | **8–11ms** |
+| BM25 query (56k chunks) | 75–172ms | **1.6–7.0ms** |
+| Overload behavior | wait 2–5 minutes | immediate 429 + `Retry-After` |
+| Eval | 5/6 | **6/6** |
+
+Throughput is still bounded by the CPU reranker: admitted throughput saturates at
+~**0.20 answers/s** from 4 concurrent onward, so the service admits 6 concurrent
+requests (p95 25.9s under a 20-way burst) and rejects the rest explicitly instead
+of silently degrading. The 16-account sweep and full trade-off table are in
+**[docs/optimization.md](docs/optimization.md)**.
 
 ## Target architecture
 
@@ -95,6 +118,7 @@ The mock RAG uses keyword scoring and templated generation; it is not a quality 
 | `docs/evaluation.md` | PoC steps, acceptance criteria, eval and load-test methodology |
 | `docs/deployment.md` | Server sizing, Nginx/SSE, security, monitoring, backups, incident runbook |
 | `docs/adoption.md` | Pilot plan, training, feedback loop, handover |
+| `docs/optimization.md` | Implementation record: admission control, async SSE, inverted index, mmap, rerank trade-offs, multi-user sweep, `global_max=6` |
 | `docs/technical-notes.md` | Concurrency/GIL/reranker/Nginx/Linux migration lessons |
 | `docs/learning-roadmap.md` | 12-week FDE learning plan and portfolio guidance |
 | `docs/poc/` | Acceptance checklist, Nginx config, env template, WSL2 + Docker guide |
