@@ -1,148 +1,202 @@
-# Enterprise RAG · FDE Portfolio (Sanitized)
+# 企业级 RAG · FDE 交付作品集（脱敏版）
 
-An on-premise RAG system for Chinese enterprise documents, designed for **~100 concurrent internal users**.
-This repository is a **sanitized portfolio**: architecture, delivery playbook, benchmark methodology, and a runnable local demo.
+面向内网约 100 并发用户的中文企业文档 RAG 系统。本仓库是**脱敏作品集**：
+包含需求与压测基线、技术选型、目标架构、交付方法、优化实录、部署运维，以及一个可直接运行的本地 Demo。
 
-> No client data, credentials, internal endpoints, or production source code are included.
-> All demo documents and addresses are synthetic.
+> 本仓库不含客户数据、账号、密钥、内网地址或生产源码。
+> 所有演示文档与地址均为虚构。
 
-## At a glance
+## 一页结论
 
-- Knowledge base: **56,426 chunks** of Chinese project documents (anonymized).
-- Benchmarked with a **mock LLM (2.3s per answer)** to isolate application-side bottlenecks.
-- Baseline: **10 concurrent → p95 42.4s; 30 → 127.3s; 50 → 173.3s; 100 → 315.5s**.
-- **After the first optimization round (2026-11)**: explicit 429 admission control;
-  50-concurrency admitted TTFT p50 127.4s → 15.2s; BM25 75–172ms → 1.6–7.0ms;
-  a 16-account sweep set `global_max=6` (p95 25.9s at a 20-way burst).
-- Root causes: in-process Python BM25 (GIL), a 2-slot CPU reranker, and synchronous SSE occupying a 40-thread pool.
-- Target architecture: **async BFF + external RAG core (RAGFlow/Elasticsearch) + internal LLM gateway + Redis/Postgres/MinIO**.
-- Included: a **runnable async BFF + mock RAG demo**, no Docker or external model required.
+- 知识库：**56,426 块**中文项目文档（已脱敏），真实 BM25 + 向量 + 重排链路。
+- 压测使用 **mock LLM（约 2.3 秒/答）**，专门隔离应用侧瓶颈。
+- 优化前：**10 并发 p95 42.4s；30 → 127.3s；50 → 173.3s；100 → 315.5s**。
+- 优化后：显式准入控制 + 立即 429；50 并发放行首字 p50 **127.4s → 15.2s**；
+  BM25 **75–172ms → 1.6–7.0ms**；16 账号扫描后 `global_max=6`，20 路突发 p95 **25.9s**。
+- 根因不是“框架选错”，而是：进程内 Python BM25 抢 GIL、CPU 重排并发过高、
+  同步 SSE 占满线程池、没有连接池。
+- 目标架构：**异步 BFF + 外部 RAG 内核（RAGFlow/Elasticsearch）+ 内部 LLM 网关 + Redis/Postgres/MinIO**。
+- 附：**不依赖 Docker 的可运行异步 BFF + 假 RAG Demo**；以及后续离线 Docker 部署、
+  索引任务队列、答辩演练与可观测性的落地记录。
 
-## Baseline (before)
+## 优化前基线
 
-Measured on a 16 vCPU machine, using 18 real-style questions and `no_cache=true`.
-The mock LLM answers in ~2.3s and never fails, so the numbers reflect the application layer.
+测试机 16 vCPU，18 条真实风格问题，`no_cache=true`。
+mock LLM 约 2.3 秒且不失败，所以数字反映的是应用层问题。
 
-| Concurrency | Success | TTFT p50 | TTFT p95 | Total p95 | Wall |
+| 并发 | 成功 | 首字 p50 | 首字 p95 | 总耗时 p95 | 墙钟 |
 |---|---|---|---|---|---|
 | 10 | 10/10 | 24.7s | 39.5s | 42.4s | 43s |
 | 30 | 30/30 | 66.0s | 124.6s | 127.3s | 133s |
 | 50 | 50/50 | 127.4s | 170.5s | 173.3s | 185s |
 | 100 | 97/100 | 225.3s | 314.4s | 315.5s | 337s |
 
-Evidence from logs:
+日志证据：
 
-- 29 reranker queue timeouts (120s wait, then degraded).
-- 32 upstream streams hit a 90s timeout even though the mock only takes 2.3s — GIL starvation, not upstream slowness.
-- At 100 concurrency, 97% of requests waited ≥120s for the first token; 57% waited ≥200s.
+- 29 次重排排队超时（等 120 秒后降级）；
+- 32 路上游流式请求触发 90 秒超时，而假模型只需 2.3 秒——是 GIL 饥饿，不是上游慢；
+- 100 并发时 97% 的请求首字等待 ≥120 秒，57% ≥200 秒。
 
-## After the first optimization round (2026-11)
+## 优化后结果（2026-11）
 
-The same app, after three rounds of changes (admission control, async SSE, and
-in-process retrieval optimizations):
+同一套应用，经过“准入控制 → 异步 SSE → 检索侧优化”三轮改造：
 
-| Metric | Before | After |
+| 指标 | 改造前 | 改造后 |
 |---|---|---|
-| 50 concurrent admitted TTFT p50 | 127.4s | **15.2s** |
-| 50 concurrent with per-user limit 2 | 127.4s | **8.5s** (rest 429) |
-| `/api/health` idle p95 | 1985ms at 100 concurrency | **8–11ms** |
-| BM25 query (56k chunks) | 75–172ms | **1.6–7.0ms** |
-| Overload behavior | wait 2–5 minutes | immediate 429 + `Retry-After` |
-| Eval | 5/6 | **6/6** |
+| 50 并发放行首字 p50 | 127.4s | **15.2s** |
+| 50 并发、每用户限 2 | 127.4s | **8.5s**（其余立即 429） |
+| `/api/health` 空闲 p95 | 100 并发时 1985ms | **8–11ms** |
+| BM25 查询（56k 块） | 75–172ms | **1.6–7.0ms** |
+| 过载行为 | 用户干等 2–5 分钟 | **立即 429 + `Retry-After`** |
+| 评测 | 5/6 | **6/6** |
 
-Throughput is still bounded by the CPU reranker: admitted throughput saturates at
-~**0.20 answers/s** from 4 concurrent onward, so the service admits 6 concurrent
-requests (p95 25.9s under a 20-way burst) and rejects the rest explicitly instead
-of silently degrading. The 16-account sweep and full trade-off table are in
-**[docs/optimization.md](docs/optimization.md)**.
+吞吐仍受 CPU 重排限制：放行吞吐从 4 并发起约 **0.20 条/秒**。
+因此最终准入 **6 路**，20 路突发时 p95 **25.9s**，超出的明确 429，
+而不是让所有人一起排队。完整的 16 账号压测表与取舍见
+**[docs/optimization.md](docs/optimization.md)**。
 
-## Target architecture
+## 目标架构
 
-```
+```text
 Browser
    │ HTTPS
-Nginx / company gateway  (SSE not buffered, 300s timeout, 100MB upload)
+Nginx / 公司网关  (SSE 不缓冲、300s 超时、100MB 上传)
    │
-FastAPI BFF (async, stateless)
-   ├─ RAGFlow / Elasticsearch  (parsing, hybrid retrieval, rerank, citations)
-   ├─ Redis                    (cache, rate limit, sessions)
-   ├─ PostgreSQL               (users, KB mapping, audit)
-   ├─ MinIO                    (documents, images)
-   └─ Internal LLM gateway     (key pool, quotas, retries)
+FastAPI BFF（异步、无状态）
+   ├─ RAGFlow / Elasticsearch  (解析、混合检索、重排、引用)
+   ├─ Redis                    (缓存、限流、会话)
+   ├─ PostgreSQL               (用户、知识库映射、审计)
+   ├─ MinIO                    (文档、图片)
+   └─ 内部 LLM 网关            (Key 池、配额、重试)
 ```
 
-Design principles:
+设计原则：
 
-- Commodity RAG (parsing, indexing, retrieval, rerank) goes to a mature engine.
-- Differentiated business logic (permissions, workflows, UI, domain rules) stays in the BFF.
-- A `RetrievalBackend` interface keeps the engine swappable (RAGFlow, Elasticsearch, mock).
-- Permissions are enforced in the BFF, not in the UI or the RAG engine.
-- Async SSE + shared connection pool + explicit concurrency limits.
+- 通用 RAG 能力（解析、索引、检索、重排）交给成熟引擎；
+- 差异化业务（权限、流程、界面、领域规则）留在 BFF；
+- `RetrievalBackend` 抽象保持检索内核可替换（RAGFlow / Elasticsearch / Mock）；
+- 权限在 BFF 强制校验，不依赖前端或 RAG 引擎；
+- 异步 SSE + 共享连接池 + 明确的并发上限；
+- 所有优化都保留回滚路径，不做不可见的“静默降级”。
 
-## Runnable local demo
+## 可运行本地 Demo
 
-The demo has no external dependencies beyond Python packages:
+除 Python 依赖外无外部服务：
 
-```
-Browser → async BFF (8020) → mock RAG (9390)
+```text
+浏览器 → 异步 BFF (8020) → 假 RAG (9390)
 ```
 
 ```bash
-# Host mode (fastest)
+# 宿主机模式（最快）
 python tools/local_dev/run_local.py --keep
-# open http://127.0.0.1:8020
+# 打开 http://127.0.0.1:8020
 
-# Docker mode
+# Docker 模式
 cd tools/local_dev
 docker compose up --build
 ```
 
-What it demonstrates:
+演示内容：
 
-- end-to-end async streaming (`async def` + `httpx.AsyncClient`, no threadpool-held SSE);
-- citations (`sources` event);
-- a global concurrency semaphore with HTTP 429;
-- a shared connection pool;
-- an adapter boundary between the BFF and the retrieval backend.
+- 端到端异步流式输出（`async def` + `httpx.AsyncClient`，SSE 不占线程池）；
+- 引用事件（`sources`）；
+- 全局并发信号量 + HTTP 429；
+- 共享连接池；
+- BFF 与检索后端之间的适配层。
 
-The mock RAG uses keyword scoring and templated generation; it is not a quality claim.
+假 RAG 只是关键词打分 + 模板生成，不代表回答质量。
 
-## Repository map
+## 2026-11 后续落地
 
-| Path | What it is |
+### 部署与运维
+
+- 在**无外网、旧版 RHEL 7** 的内网服务器上完成离线 Docker 部署：
+  Docker 20.10 静态包 + 离线 Python wheels，不依赖服务器安装 Python/PyPI。
+- 镜像**只含代码与依赖**（约 592MB，非 root 运行），数据/模型/配置通过 volume 挂载；
+  镜像内不含知识库、模型或 Key。
+- `host` 网络，应用监听 8000；单库约 4,000 块的业务知识库完成迁移，health 200。
+- 升级用日期 + git sha 镜像 tag，`.env` 固定版本；旧镜像保留，回滚只改 tag。
+- 应用日志按天写入挂载目录（保留 30 天），同时保留 Docker `json-file`（20MB × 5）；
+  不依赖容器重建仍能追溯问题。
+- 已知边界：RHEL 7 / Docker 20.10 已 EOL，当前是单机部署；
+  正式生产建议新 VM + Docker 24+，并补 Nginx/TLS、备份与集中日志。
+
+### 索引任务与数据一致性
+
+- 索引从“后台线程直接跑”改为**持久化任务队列**：
+  `queued/running/done/failed/interrupted` 状态落盘，失败重试，重启可恢复；
+- 不同知识库默认 **2 个索引 worker 并行**，同一个库仍串行；
+  索引过程按文件回报进度，前端能看到真实阶段而不是空转；
+- `registry.json` 读-改-写加锁并原子写；上传/索引临时文件使用唯一名，
+  多用户并发建库、同名文件上传不会互相覆盖；
+- 对外只暴露“已就绪 / 索引中 / 失败”，不把内部块数当作产品指标。
+
+### 答辩演练（AI 模拟评委）
+
+- 上传 PPT 后解析文字与图片，按 PPT 页面结构出题；
+- 根据候选人回答追问：回答含糊就深挖，同一个点最多追问 2 次，复读或答偏后强制换方向；
+- 首题在 PPT 解析后**后台预生成**，用户选模式/题数的时间覆盖模型耗时；
+- 每题答完即后台生成该题诊断，最后汇总只补缺失题 + 总体评价，
+  避免“答完统一生成 10 题解析”等待 1–2 分钟；
+- 根据 PPT 内容在用户**可读知识库**中推荐一个出题依据，前端预选并显示理由/置信度，
+  用户可随时改选；用户已改选或已开始演练时不会覆盖。
+
+### 交互与可观测性
+
+- 问题输入支持多行：Enter 发送、Shift+Enter 换行，中文输入法组合期间不误发；
+- 正文引用角标可点击，自动展开引用区、滚动并高亮对应片段；
+- 引用文件预览页带**左侧目录树**，当前文件高亮；命中片段会在正文中定位高亮；
+- 支持按文件或文件夹上传，选完先列出文件名；新建库索引期间禁用提问并显示进度；
+- 每个知识库保留自己的聊天记录，来回切换时恢复各自的问答历史；
+- 点踩可填写原因，与反馈一起写入问答日志，作为后续改进线索；
+- `/api/health`、预热状态、索引状态、持久化日志分开，排障不依赖猜测。
+
+### 并发取舍
+
+- 重排仍是最主要的成本中心，默认 **1 路**；被放行的请求保留完整候选与完整重排；
+- LLM 侧全局放行 6 路、单用户 2 路，超出返回 429 + `Retry-After`；
+- 不通过悄悄跳过重排/截断答案来“提高并发”，过载由准入控制明确拒绝。
+
+## 仓库结构
+
+| 路径 | 内容 |
 |---|---|
-| `docs/fde-playbook.md` | Full FDE delivery lifecycle: discover → define → design → prototype → validate → deploy → operate → adopt → evolve |
-| `docs/case-study.md` | Requirements, constraints, current architecture, baseline, SLOs |
-| `docs/selection.md` | Enterprise RAG stack comparison and decision rationale |
-| `docs/architecture.md` | Target architecture, data model, permissions, incremental indexing, rollback |
-| `docs/evaluation.md` | PoC steps, acceptance criteria, eval and load-test methodology |
-| `docs/deployment.md` | Server sizing, Nginx/SSE, security, monitoring, backups, incident runbook |
-| `docs/adoption.md` | Pilot plan, training, feedback loop, handover |
-| `docs/optimization.md` | Implementation record: admission control, async SSE, inverted index, mmap, rerank trade-offs, multi-user sweep, `global_max=6` |
-| `docs/technical-notes.md` | Concurrency/GIL/reranker/Nginx/Linux migration lessons |
-| `docs/learning-roadmap.md` | 12-week FDE learning plan and portfolio guidance |
-| `docs/poc/` | Acceptance checklist, Nginx config, env template, WSL2 + Docker guide |
-| `tools/local_dev/` | Runnable async BFF + mock RAG demo |
-| `tools/mock_llm.py` | Standalone Anthropic-compatible mock LLM used for benchmarking |
+| `docs/fde-playbook.md` | FDE 全流程：发现 → 定义 → 设计 → 原型 → 验证 → 上线 → 运维 → 推广 → 演进 |
+| `docs/case-study.md` | 需求、约束、现状架构、压测基线、SLO |
+| `docs/selection.md` | 企业 RAG 技术选型与决策依据 |
+| `docs/architecture.md` | 目标架构、数据模型、权限、增量索引、回滚 |
+| `docs/evaluation.md` | PoC 步骤、验收标准、评测与压测方法 |
+| `docs/deployment.md` | 服务器规格、Nginx/SSE、安全、监控、备份、故障手册 |
+| `docs/adoption.md` | 试点、培训、反馈闭环、交接 |
+| `docs/optimization.md` | 实施记录：准入控制、异步 SSE、倒排索引、mmap、重排取舍、多用户压测、`global_max=6` |
+| `docs/technical-notes.md` | 并发/GIL/重排/Nginx/Linux 迁移与后续工程化经验 |
+| `docs/learning-roadmap.md` | 12 周 FDE 学习计划与作品集建议 |
+| `docs/poc/` | 验收清单、Nginx 配置、环境模板、WSL2 + Docker 指南 |
+| `tools/local_dev/` | 可运行的异步 BFF + 假 RAG Demo |
+| `tools/mock_llm.py` | 压测用的 Anthropic 兼容假 LLM |
 
-## What is not included
+## 不包含的内容
 
-- Production source code, client documents, credentials, internal endpoints.
-- The private RAGFlow integration and business-specific modules.
-- Real customer data or screenshots.
+- 生产源码、客户文档、密钥、内网地址、真实截图；
+- 私有 RAGFlow 集成与业务定制模块；
+- 真实客户数据或可识别信息。
 
-The adapter contract is documented in `docs/architecture.md`; the production implementation lives in a private repository.
+检索后端适配约定见 `docs/architecture.md`；生产实现位于私有仓库。
 
-## Key lessons
+## 关键经验
 
-1. **Concurrency is a resource-model problem, not a framework problem.** Replacing FastAPI with LangChain would not fix a 2-slot reranker or GIL contention.
-2. **Measure p95 and failure tails, not averages.** The average hides a 5-minute user experience at 100 concurrency.
-3. **Externalize CPU-heavy retrieval and long-lived streams.** Async HTTP belongs in the API process; retrieval/rerank belong in workers or a search engine.
-4. **Design for rollback.** A BFF adapter lets you swap RAGFlow for Elasticsearch without rewriting permissions or UI.
-5. **Sanitize before publishing.** A private repo with client data must never become a public portfolio repo directly.
+1. **并发是资源模型问题，不是框架问题。** 把 FastAPI 换成 LangChain，
+   不会解决 2 路 CPU 重排或 GIL 争用。
+2. **看 p95 和失败尾部，不看平均值。** 平均值会掩盖 100 并发下 5 分钟的用户体验。
+3. **把 CPU 密集检索和长连接从 Web 进程里拿出去。**
+   检索/重排属于 worker 或搜索引擎，异步 HTTP 留在 API 进程。
+4. **为回滚而设计。** BFF 适配层可以换 RAGFlow/Elasticsearch，而不重写权限和 UI。
+5. **脱敏后再公开。** 带客户数据的私有仓库不能直接变成公开作品集。
+6. **不要让用户盯着静止转圈。** 可解释的阶段状态、后台预生成和真实索引进度，
+   比单纯“优化模型”更能改善体感。
 
-## 中文简介
+## 一句话总结
 
-这是一个面向内网 100 并发场景的企业 RAG 脱敏作品集：包含需求与压测基线、企业级选型、目标架构、数据与权限设计、FDE 全流程交付方法、评测/压测方法，以及一个不依赖 Docker 的可运行异步 BFF + 假 RAG 演示。
-
-生产代码、客户资料、密钥和内网地址均未包含在本仓库中。
+**并发问题不是“换个框架”能解决的，而是把 CPU 密集、长连接、共享状态从 Web 进程里拿出去；
+同时用明确的限流、可观测的状态和可回滚的部署，把系统从“能跑”做到“能交付”。**

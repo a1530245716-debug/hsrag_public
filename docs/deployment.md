@@ -129,3 +129,38 @@
 [ ] 用户培训/通知
 [ ] 7 天观察期负责人
 ```
+
+## 11. 离线 Docker 落地记录（脱敏）
+
+目标环境：内网、无外网、旧版 RHEL 7，不能安装 PyPI 依赖，也不想改动宿主机 Python。
+
+**一次性准备**
+- Docker 20.10.24 静态包（RHEL 7 最后支持版本）+ 独立 compose v2 二进制；
+  `overlay2`、`cgroup v1`，`--iptables=false --bridge=none`，容器统一 `network_mode: host`，
+  避免新增 Docker bridge/iptables 影响现有服务。
+- 基础镜像 `python:3.12-slim` 离线导入；应用依赖提前下载为 manylinux wheels；
+  `jieba` 只有 sdist，构建时用离线 wheel 先装 `setuptools/wheel`，再 `--no-build-isolation`。
+
+**镜像与挂载**
+- 应用镜像约 592MB，**只含代码和依赖**，非 root（uid 1000）运行；
+- 数据、模型、源文档、配置分别挂载：
+  `data → /app/app/data`、`models → /app/models`、`docs → /opt/rag/docs`（只读）、
+  `config.json → /app/app/config.json`（只读）；
+- 镜像内不含知识库、模型或 Key，验证命令：
+  `docker run --rm <image> ls app | grep -x data || echo "no data in image"`。
+
+**日志与运维**
+- 应用 stdout/stderr 同时按天写入挂载目录（保留 30 天），
+  包含启动、访问、检索/模型耗时和异常；
+- 保留 Docker `json-file` 20MB × 5，作为控制台快速排查通道；
+- 健康检查走 `/api/health`；容器 `restart=unless-stopped`，Docker 服务设为开机启动。
+
+**升级与回滚**
+- 镜像 tag 使用日期 + git sha，`.env` 固定 `RAG_TAG`；
+- 升级：备份数据 → 重建镜像/导入 → 改 tag → `up -d` → health/eval → 保留旧镜像；
+- 回滚：把 tag 改回上一版 → `up -d`；数据卷不动；若数据格式变更，先恢复备份。
+
+**已知边界**
+- RHEL 7 / Docker 20.10 已 EOL，只适合作为过渡环境；
+- 当前单机运行，没有多副本和高可用；
+- Nginx/TLS、集中日志、自动备份和 RAGFlow 仍需新 VM 或后续迭代。
